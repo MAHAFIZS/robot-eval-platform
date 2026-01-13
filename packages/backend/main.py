@@ -187,20 +187,17 @@ def list_runs(limit: int = 50):
 
 @app.post("/runs/{run_id}/enqueue")
 def enqueue_run(run_id: int):
+    from packages.worker.tasks import evaluate_run  # import here to avoid circular imports
+
     run = fetch_one("SELECT id, status FROM runs WHERE id=:id", {"id": run_id})
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
 
     if run["status"] != "queued":
-        raise HTTPException(status_code=409, detail=f"run status must be queued (is {run['status']})")
+        raise HTTPException(
+            status_code=409,
+            detail=f"run status must be queued (is {run['status']})",
+        )
 
-    updated = exec_returning(
-        """
-        UPDATE runs
-        SET status='running', started_at=NOW()
-        WHERE id=:id
-        RETURNING id, status, started_at
-        """,
-        {"id": run_id},
-    )
-    return {"message": "enqueued (stub)", "run": updated}
+    task = evaluate_run.delay(run_id)
+    return {"message": "enqueued", "run_id": run_id, "task_id": task.id}
