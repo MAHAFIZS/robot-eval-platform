@@ -131,7 +131,7 @@ def evaluate_run(run_id: int) -> dict:
             UPDATE runs
             SET status='completed',
                 ended_at=NOW(),
-                summary_json=:summary::jsonb,
+                summary_json=CAST(:summary AS jsonb),
                 report_uri=:report_uri
             WHERE id=:id
             RETURNING id
@@ -152,3 +152,4 @@ def evaluate_run(run_id: int) -> dict:
             {"id": run_id, "msg": str(e)},
         )
         return {"ok": False, "run_id": run_id, "error": str(e)}
+
