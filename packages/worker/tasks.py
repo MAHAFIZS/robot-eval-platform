@@ -9,10 +9,9 @@ from botocore.client import Config
 from packages.worker.celery_app import celery_app
 from packages.backend.db_exec import fetch_one, exec_returning
 
-# Day 6/7 imports
-from rep_runner.backends import make_backend
+from rep_runner import build_taskspec_from_db
 from rep_runner.runner import Runner
-from rep_runner.task_builder import build_taskspec_stub
+from rep_runner.backends import make_backend
 
 
 def utc_now() -> str:
@@ -62,24 +61,12 @@ def upload_folder_to_minio(run_id: int, local_dir: Path, bucket: str) -> tuple[s
 
 @celery_app.task(name="packages.worker.tasks.evaluate_run")
 def evaluate_run(run_id: int) -> dict:
-    """
-    Day 7: DB -> TaskSpec -> Runner -> local artifacts -> MinIO -> DB update.
-    Uses Day 6 Runner/TaskSpec abstractions.
-    """
-
-    # Fetch run row (need backend + ids)
-    run = fetch_one(
-        """
-        SELECT id, status, backend, model_id, suite_id, dataset_id
-        FROM runs
-        WHERE id=:id
-        """,
-        {"id": run_id},
-    )
+    # Validate run exists
+    run = fetch_one("SELECT id, status FROM runs WHERE id=:id", {"id": run_id})
     if not run:
         return {"ok": False, "error": "run not found", "run_id": run_id}
 
-    # Mark running (idempotent-ish)
+    # Move to running
     exec_returning(
         """
         UPDATE runs
@@ -91,32 +78,24 @@ def evaluate_run(run_id: int) -> dict:
     )
 
     try:
-        # Build TaskSpec (stub episode plan for now; Day 8+ will be suite-driven)
-        task = build_taskspec_stub(
-            run_id=run["id"],
-            backend=run["backend"],
-            model_id=run["model_id"],
-            dataset_id=run["dataset_id"],
-            suite_id=run["suite_id"],
-            episodes_n=3,
-        )
+        # 1) Build TaskSpec from DB (uses suites.config_json -> episodes)
+        task = build_taskspec_from_db(run_id)
 
-        # Select backend dynamically
+        # 2) Create backend + runner
         backend = make_backend(task.backend)
-
-        # Run -> writes artifacts into artifacts/run_<id>/...
         runner = Runner(backend=backend, local_artifact_root="artifacts")
+
+        # 3) Execute evaluation -> writes artifacts/run_<id>/...
         result = runner.run(task)
 
+        # Artifact dir must match Runner layout: artifacts/run_<id>
         out_dir = Path("artifacts") / f"run_{run_id}"
-        if not out_dir.exists():
-            raise RuntimeError(f"Expected artifact directory not found: {out_dir}")
 
-        # Upload artifacts to MinIO
+        # 4) Upload artifacts to MinIO
         bucket = os.getenv("S3_BUCKET", "artifacts")
         report_uri, _ = upload_folder_to_minio(run_id, out_dir, bucket)
 
-        # Mark completed (store runner summary)
+        # 5) Update DB with summary_json (store dict as jsonb)
         exec_returning(
             """
             UPDATE runs
