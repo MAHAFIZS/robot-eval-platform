@@ -8,3 +8,8 @@ dist/
 .DS_Store
 # runtime artifacts (generated)
 artifacts/
+# Python packaging artifacts
+*.egg-info/
+**/*.egg-info/
+dist/
+build/
