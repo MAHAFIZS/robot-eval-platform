@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rep-backends"
+version = "0.1.0"
+description = "Backend implementations for robot-eval-platform"
+requires-python = ">=3.10"
+dependencies = ["rep-core>=0.1.0", "rep-runner>=0.1.0"]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rep_backend_*"]

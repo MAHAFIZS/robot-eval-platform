@@ -1,6 +1,5 @@
 ﻿import json
 import os
-import time
 from pathlib import Path
 from datetime import datetime, timezone
 
@@ -9,6 +8,11 @@ from botocore.client import Config
 
 from packages.worker.celery_app import celery_app
 from packages.backend.db_exec import fetch_one, exec_returning
+
+# Day 6/7 imports
+from rep_runner.backends import make_backend
+from rep_runner.runner import Runner
+from rep_runner.task_builder import build_taskspec_stub
 
 
 def utc_now() -> str:
@@ -56,51 +60,26 @@ def upload_folder_to_minio(run_id: int, local_dir: Path, bucket: str) -> tuple[s
     return report_uri, base_prefix
 
 
-def write_artifacts(run_id: int) -> Path:
-    """
-    Minimal artifacts for demo: config snapshot + metrics + report.html
-    """
-    out_dir = Path("artifacts") / str(run_id)
-    (out_dir / "plots").mkdir(parents=True, exist_ok=True)
-
-    env_snapshot = {
-        "created_at": utc_now(),
-        "run_id": run_id,
-        "note": "Day5 dummy worker job (replace with Mujoco runner later)",
-    }
-    (out_dir / "env_snapshot.json").write_text(json.dumps(env_snapshot, indent=2), encoding="utf-8")
-
-    metrics = {
-        "success_rate": 1.0,
-        "time_to_success_mean": 2.3,
-        "safety_violations": 0,
-        "latency_p95_ms": 12.4,
-    }
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-
-    report_html = f"""<!doctype html>
-<html>
-<head><meta charset="utf-8"><title>Run {run_id} Report</title></head>
-<body>
-<h1>Run {run_id} Report</h1>
-<p>Status: completed</p>
-<pre>{json.dumps(metrics, indent=2)}</pre>
-</body>
-</html>
-"""
-    (out_dir / "report.html").write_text(report_html, encoding="utf-8")
-
-    return out_dir
-
-
 @celery_app.task(name="packages.worker.tasks.evaluate_run")
 def evaluate_run(run_id: int) -> dict:
-    # Validate run exists
-    run = fetch_one("SELECT id, status FROM runs WHERE id=:id", {"id": run_id})
+    """
+    Day 7: DB -> TaskSpec -> Runner -> local artifacts -> MinIO -> DB update.
+    Uses Day 6 Runner/TaskSpec abstractions.
+    """
+
+    # Fetch run row (need backend + ids)
+    run = fetch_one(
+        """
+        SELECT id, status, backend, model_id, suite_id, dataset_id
+        FROM runs
+        WHERE id=:id
+        """,
+        {"id": run_id},
+    )
     if not run:
         return {"ok": False, "error": "run not found", "run_id": run_id}
 
-    # Move to running (idempotent-ish)
+    # Mark running (idempotent-ish)
     exec_returning(
         """
         UPDATE runs
@@ -112,20 +91,32 @@ def evaluate_run(run_id: int) -> dict:
     )
 
     try:
-        # Simulate doing work (replace later with Mujoco evaluation)
-        time.sleep(2)
+        # Build TaskSpec (stub episode plan for now; Day 8+ will be suite-driven)
+        task = build_taskspec_stub(
+            run_id=run["id"],
+            backend=run["backend"],
+            model_id=run["model_id"],
+            dataset_id=run["dataset_id"],
+            suite_id=run["suite_id"],
+            episodes_n=3,
+        )
 
-        # Write local artifacts
-        out_dir = write_artifacts(run_id)
+        # Select backend dynamically
+        backend = make_backend(task.backend)
+
+        # Run -> writes artifacts into artifacts/run_<id>/...
+        runner = Runner(backend=backend, local_artifact_root="artifacts")
+        result = runner.run(task)
+
+        out_dir = Path("artifacts") / f"run_{run_id}"
+        if not out_dir.exists():
+            raise RuntimeError(f"Expected artifact directory not found: {out_dir}")
 
         # Upload artifacts to MinIO
         bucket = os.getenv("S3_BUCKET", "artifacts")
         report_uri, _ = upload_folder_to_minio(run_id, out_dir, bucket)
 
-        # Read metrics back for DB summary
-        metrics = json.loads((out_dir / "metrics.json").read_text(encoding="utf-8"))
-
-        # Mark completed
+        # Mark completed (store runner summary)
         exec_returning(
             """
             UPDATE runs
@@ -136,10 +127,10 @@ def evaluate_run(run_id: int) -> dict:
             WHERE id=:id
             RETURNING id
             """,
-            {"id": run_id, "summary": json.dumps(metrics), "report_uri": report_uri},
+            {"id": run_id, "summary": json.dumps(result.summary), "report_uri": report_uri},
         )
 
-        return {"ok": True, "run_id": run_id, "report_uri": report_uri, "metrics": metrics}
+        return {"ok": True, "run_id": run_id, "report_uri": report_uri, "summary": result.summary}
 
     except Exception as e:
         exec_returning(
@@ -152,4 +143,3 @@ def evaluate_run(run_id: int) -> dict:
             {"id": run_id, "msg": str(e)},
         )
         return {"ok": False, "run_id": run_id, "error": str(e)}
-

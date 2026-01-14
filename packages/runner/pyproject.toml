@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rep-runner"
+version = "0.1.0"
+description = "Runner abstraction for robot evaluation tasks"
+requires-python = ">=3.10"
+dependencies = ["rep-core>=0.1.0"]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rep_runner*"]

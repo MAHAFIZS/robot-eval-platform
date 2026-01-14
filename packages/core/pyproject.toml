@@ -1,0 +1,17 @@
+[build-system]
+requires = ["setuptools>=68", "wheel"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "rep-core"
+version = "0.1.0"
+description = "Robot eval platform core specs and artifact layout"
+requires-python = ">=3.10"
+dependencies = ["pydantic>=2.0"]
+
+[tool.setuptools]
+package-dir = {"" = "."}
+
+[tool.setuptools.packages.find]
+where = ["."]
+include = ["rep_core*"]
