@@ -1,6 +1,14 @@
-﻿from fastapi import FastAPI, HTTPException
-from pydantic import BaseModel, Field
+﻿# packages/backend/main.py
+
+import os
 from typing import List, Optional, Literal
+from urllib.parse import urlparse
+
+import boto3
+from botocore.client import Config
+from fastapi import FastAPI, HTTPException
+from fastapi.responses import HTMLResponse, RedirectResponse
+from pydantic import BaseModel, Field
 
 from packages.backend.db import ping_db
 from packages.backend.db_exec import fetch_all, fetch_one, exec_returning
@@ -8,9 +16,53 @@ from packages.backend.hashutil import sha256_text
 
 app = FastAPI(title="Robot Eval Orchestrator API")
 
+
+# ----------------------
+# Health
+# ----------------------
 @app.get("/health")
 def health():
     return {"status": "ok", "db": "ok" if ping_db() else "down"}
+
+
+# ----------------------
+# MinIO / S3 helpers (Day 9)
+# ----------------------
+def minio_client():
+    endpoint_url = os.getenv("S3_ENDPOINT_URL", "http://localhost:9000")
+    access_key = os.getenv("S3_ACCESS_KEY", "minio")
+    secret_key = os.getenv("S3_SECRET_KEY", "minio12345")
+    region = os.getenv("S3_REGION", "us-east-1")
+
+    return boto3.client(
+        "s3",
+        endpoint_url=endpoint_url,
+        aws_access_key_id=access_key,
+        aws_secret_access_key=secret_key,
+        region_name=region,
+        config=Config(signature_version="s3v4"),
+    )
+
+
+def parse_s3_uri(uri: str) -> tuple[str, str]:
+    # s3://bucket/key/path/file.html
+    parsed = urlparse(uri)
+    if parsed.scheme != "s3" or not parsed.netloc or not parsed.path:
+        raise ValueError(f"invalid s3 uri: {uri}")
+    bucket = parsed.netloc
+    key = parsed.path.lstrip("/")
+    return bucket, key
+
+
+def presign_s3_get(uri: str, expires_seconds: int = 3600) -> str:
+    s3 = minio_client()
+    bucket, key = parse_s3_uri(uri)
+    return s3.generate_presigned_url(
+        "get_object",
+        Params={"Bucket": bucket, "Key": key},
+        ExpiresIn=expires_seconds,
+    )
+
 
 # ----------------------
 # Models
@@ -21,6 +73,7 @@ class ModelCreate(BaseModel):
     tags: List[str] = Field(default_factory=list)
     artifact_uri: Optional[str] = None
     commit_hash: Optional[str] = None
+
 
 @app.post("/models")
 def create_model(payload: ModelCreate):
@@ -47,6 +100,7 @@ def create_model(payload: ModelCreate):
     )
     return row
 
+
 @app.get("/models")
 def list_models(tag: Optional[str] = None):
     if tag:
@@ -56,12 +110,14 @@ def list_models(tag: Optional[str] = None):
         )
     return fetch_all("SELECT * FROM models ORDER BY created_at DESC")
 
+
 # ----------------------
 # Suites
 # ----------------------
 class SuiteCreate(BaseModel):
     name: str
     yaml_spec: str  # store raw YAML text
+
 
 @app.post("/suites")
 def create_suite(payload: SuiteCreate):
@@ -82,9 +138,11 @@ def create_suite(payload: SuiteCreate):
     )
     return row
 
+
 @app.get("/suites")
 def list_suites():
     return fetch_all("SELECT id, name, hash, created_at FROM suites ORDER BY created_at DESC")
+
 
 @app.get("/suites/{suite_id}")
 def get_suite(suite_id: int):
@@ -92,6 +150,7 @@ def get_suite(suite_id: int):
     if not row:
         raise HTTPException(status_code=404, detail="suite not found")
     return row
+
 
 # ----------------------
 # Datasets
@@ -102,9 +161,9 @@ class DatasetCreate(BaseModel):
     uri: str
     hash: Optional[str] = None  # allow providing a precomputed hash
 
+
 @app.post("/datasets")
 def create_dataset(payload: DatasetCreate):
-    # If user didn't provide a hash, derive from name+version+uri (simple governance for now)
     ds_hash = payload.hash or sha256_text(f"{payload.name}|{payload.version}|{payload.uri}")
 
     existing_nv = fetch_one(
@@ -128,9 +187,11 @@ def create_dataset(payload: DatasetCreate):
     )
     return row
 
+
 @app.get("/datasets")
 def list_datasets():
     return fetch_all("SELECT * FROM datasets ORDER BY created_at DESC")
+
 
 # ----------------------
 # Runs
@@ -140,6 +201,7 @@ class RunCreate(BaseModel):
     suite_id: Optional[int] = None
     dataset_id: Optional[int] = None
     backend: Literal["mujoco", "real", "replay"] = "mujoco"
+
 
 @app.post("/runs")
 def create_run(payload: RunCreate):
@@ -172,6 +234,7 @@ def create_run(payload: RunCreate):
     )
     return row
 
+
 @app.get("/runs")
 def list_runs(limit: int = 50):
     return fetch_all(
@@ -184,6 +247,124 @@ def list_runs(limit: int = 50):
         """,
         {"limit": limit},
     )
+
+
+# Day 9: run detail endpoint
+@app.get("/runs/{run_id}")
+def get_run(run_id: int):
+    run = fetch_one(
+        """
+        SELECT id, model_id, suite_id, dataset_id, backend, status,
+               started_at, ended_at, summary_json, report_uri, error_message, created_at
+        FROM runs
+        WHERE id=:id
+        """,
+        {"id": run_id},
+    )
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    return run
+
+
+# Day 9: open report endpoint (redirect to presigned MinIO URL)
+@app.get("/runs/{run_id}/report")
+def open_report(run_id: int):
+    run = fetch_one("SELECT id, report_uri FROM runs WHERE id=:id", {"id": run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
+    uri = run.get("report_uri")
+    if not uri:
+        raise HTTPException(status_code=404, detail="report_uri missing")
+
+    if uri.startswith("http://") or uri.startswith("https://"):
+        return RedirectResponse(uri)
+
+    if uri.startswith("s3://"):
+        try:
+            url = presign_s3_get(uri, expires_seconds=3600)
+        except Exception as e:
+            raise HTTPException(status_code=500, detail=f"failed to presign report: {e}")
+        return RedirectResponse(url)
+
+    raise HTTPException(status_code=400, detail="unknown report_uri scheme")
+
+
+# Day 9: minimal UI
+@app.get("/ui/runs", response_class=HTMLResponse)
+def ui_runs():
+    runs = fetch_all(
+        """
+        SELECT id, backend, status, created_at, started_at, ended_at,
+               report_uri, summary_json, error_message
+        FROM runs
+        ORDER BY id DESC
+        LIMIT 50
+        """,
+        {},
+    )
+
+    rows_html = ""
+    for r in runs:
+        rid = r["id"]
+        status = r["status"]
+        backend = r["backend"]
+        created = r["created_at"]
+        summary = r.get("summary_json")
+        err = r.get("error_message") or ""
+
+        report_btn = (
+            f'<a class="btn" href="/runs/{rid}/report" target="_blank">Open report</a>'
+            if r.get("report_uri")
+            else ""
+        )
+
+        rows_html += f"""
+        <tr>
+          <td>{rid}</td>
+          <td>{backend}</td>
+          <td><b>{status}</b></td>
+          <td>{created}</td>
+          <td><pre>{summary}</pre></td>
+          <td style="color:#ffb4b4;">{err}</td>
+          <td>{report_btn}</td>
+        </tr>
+        """
+
+    html = f"""
+    <!doctype html>
+    <html>
+    <head>
+      <meta charset="utf-8" />
+      <title>robot-eval-platform — Runs</title>
+      <style>
+        body {{ font-family: Arial, sans-serif; margin: 24px; background: #0b0f19; color: #e6e6e6; }}
+        h1 {{ margin-bottom: 12px; }}
+        table {{ width: 100%; border-collapse: collapse; }}
+        th, td {{ border-bottom: 1px solid #222; padding: 10px; vertical-align: top; }}
+        th {{ text-align: left; color: #b8c0ff; }}
+        pre {{ margin: 0; white-space: pre-wrap; word-break: break-word; max-width: 520px; }}
+        .btn {{ display: inline-block; padding: 6px 10px; border: 1px solid #3a4; border-radius: 6px; color: #dff; text-decoration: none; }}
+        .btn:hover {{ background: #163; }}
+      </style>
+    </head>
+    <body>
+      <h1>Runs</h1>
+      <p>Latest 50 runs. Click “Open report” to view MinIO-hosted HTML.</p>
+      <table>
+        <thead>
+          <tr>
+            <th>ID</th><th>Backend</th><th>Status</th><th>Created</th><th>Summary</th><th>Error</th><th>Report</th>
+          </tr>
+        </thead>
+        <tbody>
+          {rows_html}
+        </tbody>
+      </table>
+    </body>
+    </html>
+    """
+    return HTMLResponse(content=html)
+
 
 @app.post("/runs/{run_id}/enqueue")
 def enqueue_run(run_id: int):
