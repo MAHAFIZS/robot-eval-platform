@@ -434,7 +434,8 @@ def list_run_artifacts(run_id: int):
         )
 
     # Local artifacts folder for this run
-    run_dir = os.path.join(ARTIFACTS_LOCAL_DIR, str(run_id))
+    run_dir = os.path.join(ARTIFACTS_LOCAL_DIR, f"run_{run_id}")
+
     if os.path.isdir(run_dir):
         for fname in sorted(os.listdir(run_dir)):
             # Avoid duplicating report.html if already included above
@@ -457,30 +458,30 @@ def list_run_artifacts(run_id: int):
 
 @app.get("/runs/{run_id}/artifacts/{name}")
 def download_run_artifact(run_id: int, name: str):
-    """
-    Download/resolve an artifact.
-    - report.html -> uses the report resolver (supports s3://, http(s), file://, local relative)
-    - any other name -> tries local file under ARTIFACTS_LOCAL_DIR/<run_id>/<name>
-      (Day 10 keeps this simple; Day 11 you can store an artifact index in DB)
-    """
-    if name == "report.html":
-        return open_report(run_id)
+    run = fetch_one("SELECT id, report_uri FROM runs WHERE id=:id", {"id": run_id})
+    if not run:
+        raise HTTPException(status_code=404, detail="run not found")
 
-    # Local only for now
-    rel = f"{run_id}/{name}"
-    try:
-        path = _safe_join(ARTIFACTS_LOCAL_DIR, rel)
-    except ValueError:
-        raise HTTPException(status_code=400, detail="invalid artifact path")
+    report_uri = (run.get("report_uri") or "").strip()
+    if report_uri.startswith("s3://"):
+        # Derive artifact key from report_uri base prefix
+        bucket, report_key = parse_s3_uri(report_uri)   # report_key = "13/report.html"
+        prefix = report_key.rsplit("/", 1)[0]           # "13"
+        key = f"{prefix}/{name}"                        # "13/rollout.mp4"
+        s3 = minio_client()
+        url = s3.generate_presigned_url(
+            "get_object",
+            Params={"Bucket": bucket, "Key": key},
+            ExpiresIn=3600,
+        )
+        return RedirectResponse(url)
 
-    if not os.path.exists(path) or not os.path.isfile(path):
+    # fallback to local (your old logic)
+    rel = f"run_{run_id}/{name}"
+    path = _safe_join(ARTIFACTS_LOCAL_DIR, rel)
+    if not os.path.exists(path):
         raise HTTPException(status_code=404, detail="artifact not found")
-
-    return FileResponse(
-        path,
-        media_type=_media_type_for_name(name),
-        filename=name,
-    )
+    return FileResponse(path, media_type=_media_type_for_name(name), filename=name)
 
 
 # ----------------------
