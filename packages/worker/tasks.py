@@ -5,15 +5,25 @@ import os
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict
+from typing import Any, Dict, List
 
 import boto3
 from botocore.client import Config
 
 from packages.worker.celery_app import celery_app
-from packages.backend.db_exec import fetch_one, exec_returning
+from packages.backend.db_exec import (
+    fetch_one,
+    exec_returning,
+    create_run_episode,
+    complete_run_episode,
+    fail_run_episode,
+    list_run_episodes,
+)
 
-from rep_runner import build_taskspec_from_db
+# IMPORTANT: use your real module path
+from packages.runner.rep_runner.build_taskspec_from_db import build_taskspec_from_db
+
+# Keep these as you already had
 from rep_runner.runner import Runner
 from rep_runner.backends import make_backend
 
@@ -108,7 +118,7 @@ def write_text(path: Path, text: str):
 
 
 # ----------------------------
-# Day 11: demo MuJoCo scene for fallback video
+# Demo MuJoCo scene for fallback video
 # ----------------------------
 DEMO_XML = r"""
 <mujoco model="ball">
@@ -176,24 +186,71 @@ def ensure_rollout_video(out_dir: Path, run_id: int, prefer_existing: bool = Tru
 
 
 # ----------------------------
-# HTML report (IMPORTANT FIX)
+# HTML report with episode table (+ metrics link)
 # ----------------------------
-def build_report_html(run_id: int, status: str, summary: Dict[str, Any]) -> str:
-    """
-    Generates a simple HTML report.
-
-    IMPORTANT:
-    - The report is usually opened from MinIO (localhost:9000).
-    - So video links MUST be absolute to FastAPI (localhost:8000), otherwise you get AccessDenied from MinIO.
-    """
+def build_report_html(run_id: int, status: str, summary: Dict[str, Any], episodes: List[dict]) -> str:
     public_base = os.getenv("PUBLIC_BASE_URL", "http://localhost:8000").rstrip("/")
+
+    # legacy root video
     video_src = f"{public_base}/runs/{run_id}/artifacts/rollout.mp4"
+
     artifacts_json = f"{public_base}/runs/{run_id}/artifacts"
     run_json = f"{public_base}/runs/{run_id}"
+    episodes_json = f"{public_base}/runs/{run_id}/episodes"
 
     def g(k: str, default: Any = ""):
         v = summary.get(k, default)
         return default if v is None else v
+
+    def esc(s: Any) -> str:
+        s = "" if s is None else str(s)
+        return (
+            s.replace("&", "&amp;")
+            .replace("<", "&lt;")
+            .replace(">", "&gt;")
+            .replace('"', "&quot;")
+        )
+
+    rows_html = ""
+    for ep in episodes:
+        idx = ep.get("episode_index")
+        st = ep.get("status")
+        mj = ep.get("metrics_json") or {}
+
+        success = mj.get("success", "")
+        steps = mj.get("steps", "")
+        reward = mj.get("reward", "")
+        duration_ms = mj.get("duration_ms", "")
+
+        ep_video_key = f"episodes/{int(idx):03d}/rollout.mp4"
+        ep_metrics_key = f"episodes/{int(idx):03d}/metrics.json"
+
+        ep_video_url = f"{public_base}/runs/{run_id}/artifacts/{ep_video_key}"
+        ep_metrics_url = f"{public_base}/runs/{run_id}/artifacts/{ep_metrics_key}"
+
+        rows_html += f"""
+          <tr>
+            <td style="padding:8px; border-bottom:1px solid #eee;">{idx}</td>
+            <td style="padding:8px; border-bottom:1px solid #eee;">{esc(st)}</td>
+            <td style="padding:8px; border-bottom:1px solid #eee;">{esc(success)}</td>
+            <td style="padding:8px; border-bottom:1px solid #eee;">{esc(steps)}</td>
+            <td style="padding:8px; border-bottom:1px solid #eee;">{esc(reward)}</td>
+            <td style="padding:8px; border-bottom:1px solid #eee;">{esc(duration_ms)}</td>
+            <td style="padding:8px; border-bottom:1px solid #eee;">
+              <a href="{ep_video_url}" target="_blank">Open video</a>
+            </td>
+            <td style="padding:8px; border-bottom:1px solid #eee;">
+              <a href="{ep_metrics_url}" target="_blank">metrics.json</a>
+            </td>
+          </tr>
+        """
+
+    if not rows_html:
+        rows_html = """
+          <tr>
+            <td colspan="8" style="padding:10px; color:#666;">No episode rows found.</td>
+          </tr>
+        """
 
     return f"""<!doctype html>
 <html>
@@ -203,26 +260,47 @@ def build_report_html(run_id: int, status: str, summary: Dict[str, Any]) -> str:
 </head>
 <body style="font-family: system-ui, Arial, sans-serif; max-width: 980px; margin: 40px auto; line-height: 1.45;">
   <h1>Run {run_id} Report</h1>
-  <p><b>Status:</b> {status}</p>
+  <p><b>Status:</b> {esc(status)}</p>
 
   <p>
     <a href="{run_json}" target="_blank">Run JSON</a> ·
+    <a href="{episodes_json}" target="_blank">Episodes JSON</a> ·
     <a href="{artifacts_json}" target="_blank">Artifacts JSON</a>
   </p>
 
   <h2>KPIs</h2>
   <ul>
-    <li><b>Backend:</b> {g("backend")}</li>
-    <li><b>Episodes:</b> {g("num_episodes")}</li>
-    <li><b>Success rate:</b> {g("success_rate")}</li>
-    <li><b>Latency p95 (ms):</b> {g("latency_p95_ms")}</li>
-    <li><b>Safety violations:</b> {g("safety_violations")}</li>
-    <li><b>Time-to-success mean (s):</b> {g("time_to_success_mean_s")}</li>
+    <li><b>Backend:</b> {esc(g("backend"))}</li>
+    <li><b>Episodes:</b> {esc(g("num_episodes"))}</li>
+    <li><b>Success rate:</b> {esc(g("success_rate"))}</li>
+    <li><b>Mean duration (ms):</b> {esc(g("duration_mean_ms"))}</li>
+    <li><b>Latency p95 (ms):</b> {esc(g("latency_p95_ms"))}</li>
+    <li><b>Safety violations:</b> {esc(g("safety_violations"))}</li>
+    <li><b>Time-to-success mean (s):</b> {esc(g("time_to_success_mean_s"))}</li>
   </ul>
 
-  <h2>Simulation video</h2>
+  <h2>Episode metrics</h2>
+  <table style="width:100%; border-collapse:collapse; border:1px solid #eee; border-radius:10px; overflow:hidden;">
+    <thead>
+      <tr style="background:#fafafa;">
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Episode</th>
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Status</th>
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Success</th>
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Steps</th>
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Reward</th>
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Duration (ms)</th>
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Video</th>
+        <th style="text-align:left; padding:10px; border-bottom:1px solid #eee;">Metrics</th>
+      </tr>
+    </thead>
+    <tbody>
+      {rows_html}
+    </tbody>
+  </table>
+
+  <h2>Run video (legacy)</h2>
   <p style="color:#666; margin-top:-6px;">
-    Video is served via FastAPI so it can presign from MinIO:
+    Kept for backward compatibility. It points to episode 0 if available:
     <a href="{video_src}" target="_blank">{video_src}</a>
   </p>
 
@@ -245,12 +323,10 @@ def build_report_html(run_id: int, status: str, summary: Dict[str, Any]) -> str:
 def evaluate_run(run_id: int) -> dict:
     logger.info("Starting run_id=%s", run_id)
 
-    # Validate run exists
     run = fetch_one("SELECT id, status, backend FROM runs WHERE id=:id", {"id": run_id})
     if not run:
         return {"ok": False, "error": "run not found", "run_id": run_id}
 
-    # Move to running
     exec_returning(
         """
         UPDATE runs
@@ -262,8 +338,6 @@ def evaluate_run(run_id: int) -> dict:
     )
 
     artifacts_root = Path(os.getenv("ARTIFACTS_LOCAL_DIR", "artifacts"))
-
-    # IMPORTANT: use artifacts/<run_id>/... (matches backend Day10 assumptions)
     out_dir = artifacts_root / str(run_id)
     out_dir.mkdir(parents=True, exist_ok=True)
 
@@ -275,38 +349,143 @@ def evaluate_run(run_id: int) -> dict:
         backend = make_backend(task.backend)
         runner = Runner(backend=backend, local_artifact_root=str(artifacts_root))
 
-        # 3) Execute evaluation
-        result = runner.run(task)
+        # 3) Execute evaluation EPISODE-BY-EPISODE
+        episodes = list(getattr(task, "episodes", []) or [])
+        num_episodes = len(episodes) if episodes else int(getattr(task, "config", {}).get("num_episodes", 1) or 1)
 
-        # NOTE:
-        # If your Runner writes into artifacts/run_<id>/ by itself, we still write our “official”
-        # report/summary/video into artifacts/<id>/ and upload THAT.
+        logger.info("Running %s episodes for run_id=%s", num_episodes, run_id)
 
-        # 4) Normalize summary
-        summary: Dict[str, Any] = dict(getattr(result, "summary", None) or {})
-        summary.setdefault("run_id", run_id)
-        summary.setdefault("backend", getattr(task, "backend", run.get("backend")))
-        summary.setdefault("num_episodes", summary.get("num_episodes", summary.get("episodes", 0)))
-        summary.setdefault("success_rate", summary.get("success_rate", None))
-        summary.setdefault("latency_p95_ms", summary.get("latency_p95_ms", None))
-        summary.setdefault("safety_violations", summary.get("safety_violations", None))
-        summary.setdefault("time_to_success_mean_s", summary.get("time_to_success_mean_s", None))
+        for ep in range(num_episodes):
+            logger.info("Episode loop: run_id=%s ep=%s/%s", run_id, ep, num_episodes)
+
+            ep_id = create_run_episode(run_id=run_id, episode_index=ep)
+            ep_dir = out_dir / "episodes" / f"{ep:03d}"
+            ep_dir.mkdir(parents=True, exist_ok=True)
+
+            t0 = datetime.now(timezone.utc)
+            try:
+                # IMPORTANT: avoid mutating the shared task object
+                task_ep = task.model_copy(
+                    deep=True,
+                    update={
+                        "num_episodes": 1,
+                        "episodes": [task.episodes[ep]],  # reuse already-built episode
+                    },
+                )
+
+                runner.run(task_ep)
+
+                t1 = datetime.now(timezone.utc)
+                duration_ms = int((t1 - t0).total_seconds() * 1000)
+
+                metrics = {
+                    "success": True,
+                    "steps": None,
+                    "reward": None,
+                    "duration_ms": duration_ms,
+                }
+
+                write_json(ep_dir / "metrics.json", metrics)
+
+                video_path = ensure_rollout_video(
+                    out_dir=ep_dir,
+                    run_id=run_id,
+                    prefer_existing=True,
+                )
+
+                if (not video_path.exists()) or video_path.stat().st_size < 10_000:
+                    raise RuntimeError(
+                        f"Invalid rollout video for run {run_id} ep {ep}: "
+                        f"{video_path} size="
+                        f"{video_path.stat().st_size if video_path.exists() else 'MISSING'}"
+                    )
+
+                complete_run_episode(ep_id, metrics)
+
+            except Exception as e:
+                # mark failed in DB
+                fail_run_episode(ep_id, str(e))
+                write_text(ep_dir / "error.txt", str(e))
+
+                # still write metrics + generate fallback video
+                t1 = datetime.now(timezone.utc)
+                duration_ms = int((t1 - t0).total_seconds() * 1000)
+                fail_metrics = {
+                    "success": False,
+                    "steps": None,
+                    "reward": None,
+                    "duration_ms": duration_ms,
+                    "error": str(e),
+                }
+                write_json(ep_dir / "metrics.json", fail_metrics)
+
+                # Force-create a video so your report link never 404s/NoSuchKey
+                ensure_rollout_video(out_dir=ep_dir, run_id=run_id, prefer_existing=False)
+
+                logger.exception("Episode failed run_id=%s ep=%s", run_id, ep)
+
+        # 4) Aggregate summary from episodes
+        episodes = list_run_episodes(run_id)
+
+        succ_vals: List[float] = []
+        durations: List[int] = []
+
+        for ep in episodes:
+            mj = ep.get("metrics_json") or {}
+            st = (ep.get("status") or "").lower()
+
+            # If metrics_json is missing (e.g. failed eps), treat failed as 0
+            if "success" in mj:
+                succ_vals.append(1.0 if mj.get("success") else 0.0)
+            else:
+                if st == "failed":
+                    succ_vals.append(0.0)
+
+            if mj.get("duration_ms") is not None:
+                try:
+                    durations.append(int(mj["duration_ms"]))
+                except Exception:
+                    pass
+
+        success_rate = (sum(succ_vals) / len(succ_vals)) if succ_vals else None
+        duration_mean_ms = (sum(durations) / len(durations)) if durations else None
+
+        summary: Dict[str, Any] = {
+            "run_id": run_id,
+            "backend": getattr(task, "backend", run.get("backend")),
+            "num_episodes": len(episodes),
+            "success_rate": success_rate,
+            "duration_mean_ms": duration_mean_ms,
+            "latency_p95_ms": None,
+            "safety_violations": None,
+            "time_to_success_mean_s": None,
+        }
 
         write_json(out_dir / "summary.json", summary)
 
-        # 5) Ensure rollout.mp4
-        video_path = ensure_rollout_video(out_dir=out_dir, run_id=run_id, prefer_existing=True)
-        summary["rollout_generated"] = bool(video_path.exists())
+        # 5) Keep legacy rollout.mp4 at run root (copy episode 0 if exists)
+        ep0_video = out_dir / "episodes" / "000" / "rollout.mp4"
+        if ep0_video.exists():
+            (out_dir / "rollout.mp4").write_bytes(ep0_video.read_bytes())
+            summary["rollout_generated"] = True
+        else:
+            video_path = ensure_rollout_video(out_dir=out_dir, run_id=run_id, prefer_existing=True)
+            summary["rollout_generated"] = bool(video_path.exists())
 
-        # 6) Write report.html (with absolute FastAPI links)
-        report_html = build_report_html(run_id=run_id, status="completed", summary=summary)
+        # 6) Report with episode table
+        report_html = build_report_html(
+            run_id=run_id,
+            status="completed",
+            summary=summary,
+            episodes=episodes,
+        )
         write_text(out_dir / "report.html", report_html)
 
-        # 7) Upload artifacts to MinIO (bucket artifacts by default)
+        # 7) Upload artifacts to MinIO
         bucket = os.getenv("S3_BUCKET", "artifacts")
         report_uri = upload_folder_to_minio(run_id, out_dir, bucket)
 
-        # 8) Update DB
+        # 8) Update runs table
         exec_returning(
             """
             UPDATE runs

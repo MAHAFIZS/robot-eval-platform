@@ -3,7 +3,7 @@
 import os
 from typing import List, Optional, Literal, Any, Dict
 from urllib.parse import urlparse
-
+from db_exec import list_run_episodes
 import boto3
 from botocore.client import Config
 from fastapi import FastAPI, HTTPException
@@ -197,7 +197,9 @@ class SuiteCreate(BaseModel):
     name: str
     yaml_spec: str  # store raw YAML text
 
-
+@app.get("/runs/{run_id}/episodes")
+def get_run_episodes(run_id: int):
+    return {"run_id": run_id, "episodes": list_run_episodes(run_id)}
 @app.post("/suites")
 def create_suite(payload: SuiteCreate):
     spec_hash = sha256_text(payload.yaml_spec)
@@ -456,8 +458,8 @@ def list_run_artifacts(run_id: int):
     return {"run_id": run_id, "artifacts": artifacts}
 
 
-@app.get("/runs/{run_id}/artifacts/{name}")
-def download_run_artifact(run_id: int, name: str):
+@app.get("/runs/{run_id}/artifacts/{name:path}")
+def download_artifact(run_id: int, name: str):
     run = fetch_one("SELECT id, report_uri FROM runs WHERE id=:id", {"id": run_id})
     if not run:
         raise HTTPException(status_code=404, detail="run not found")
