@@ -1,9 +1,13 @@
 ﻿# packages/backend/main.py
-
+import json
 import os
+import subprocess
+import random
 from typing import List, Optional, Literal, Any, Dict
 from urllib.parse import urlparse
+
 from db_exec import list_run_episodes
+
 import boto3
 from botocore.client import Config
 from fastapi import FastAPI, HTTPException
@@ -19,6 +23,34 @@ app = FastAPI(title="Robot Eval Orchestrator API")
 # Where local artifacts live (if you store artifacts on disk as well)
 # Expect structure like: <ARTIFACTS_LOCAL_DIR>/<run_id>/report.html, summary.json, ...
 ARTIFACTS_LOCAL_DIR = os.getenv("ARTIFACTS_LOCAL_DIR", "./artifacts")
+
+# ----------------------
+# Reproducibility (Day 1)
+# ----------------------
+WORKER_VERSION = os.getenv("WORKER_VERSION", "dev")
+
+
+def get_git_commit() -> Optional[str]:
+    # Prefer env var (works in Docker/CI), fallback to git command (works in dev)
+    env_sha = os.getenv("GIT_COMMIT")
+    if env_sha:
+        return env_sha.strip()
+
+    try:
+        return subprocess.check_output(["git", "rev-parse", "HEAD"], text=True).strip()
+    except Exception:
+        return None
+
+
+def make_seed() -> int:
+    # allow overriding for reproducible re-runs
+    s = os.getenv("RUN_SEED")
+    if s:
+        try:
+            return int(s)
+        except Exception:
+            pass
+    return random.randint(1, 2_147_483_647)
 
 
 # ----------------------
@@ -197,9 +229,12 @@ class SuiteCreate(BaseModel):
     name: str
     yaml_spec: str  # store raw YAML text
 
+
 @app.get("/runs/{run_id}/episodes")
 def get_run_episodes(run_id: int):
     return {"run_id": run_id, "episodes": list_run_episodes(run_id)}
+
+
 @app.post("/suites")
 def create_suite(payload: SuiteCreate):
     spec_hash = sha256_text(payload.yaml_spec)
@@ -284,8 +319,10 @@ class RunCreate(BaseModel):
     backend: Literal["mujoco", "real", "replay"] = "mujoco"
 
 
+
 @app.post("/runs")
 def create_run(payload: RunCreate):
+    # Validate IDs
     m = fetch_one("SELECT id FROM models WHERE id=:id", {"id": payload.model_id})
     if not m:
         raise HTTPException(status_code=404, detail="model_id not found")
@@ -300,22 +337,50 @@ def create_run(payload: RunCreate):
         if not d:
             raise HTTPException(status_code=404, detail="dataset_id not found")
 
+    # ---- Reproducibility fields ----
+    git_commit = os.getenv("GIT_COMMIT")
+    if not git_commit:
+        try:
+            import subprocess
+            git_commit = subprocess.check_output(
+                ["git", "rev-parse", "HEAD"],
+                cwd=os.getcwd(),
+                text=True,
+            ).strip()
+        except Exception:
+            git_commit = None
+
+    seed = int.from_bytes(os.urandom(4), "big")
+    worker_version = os.getenv("WORKER_VERSION", "dev")
+
+    # Store config_snapshot as JSON TEXT (not dict), then CAST in SQL
+    config_snapshot = None
+    if payload.suite_id is not None:
+        srow = fetch_one("SELECT yaml_spec FROM suites WHERE id=:id", {"id": payload.suite_id})
+        if srow and srow.get("yaml_spec"):
+            config_snapshot = json.dumps({"suite_yaml_spec": srow["yaml_spec"]})
+
     row = exec_returning(
         """
-        INSERT INTO runs (model_id, suite_id, dataset_id, backend, status)
-        VALUES (:model_id, :suite_id, :dataset_id, :backend, 'queued')
-        RETURNING id, model_id, suite_id, dataset_id, backend, status, created_at
+        INSERT INTO runs (model_id, suite_id, dataset_id, backend, status,
+                          git_commit, config_snapshot, seed, worker_version)
+        VALUES (:model_id, :suite_id, :dataset_id, :backend, 'queued',
+                :git_commit, CAST(:config_snapshot AS json), :seed, :worker_version)
+        RETURNING id, model_id, suite_id, dataset_id, backend, status,
+                  git_commit, config_snapshot, seed, worker_version, created_at
         """,
         {
             "model_id": payload.model_id,
             "suite_id": payload.suite_id,
             "dataset_id": payload.dataset_id,
             "backend": payload.backend,
+            "git_commit": git_commit,
+            "config_snapshot": config_snapshot,  # json string or None
+            "seed": seed,
+            "worker_version": worker_version,
         },
     )
     return row
-
-
 @app.get("/runs")
 def list_runs(limit: int = 50):
     rows = fetch_all(
@@ -344,7 +409,8 @@ def get_run(run_id: int):
     run = fetch_one(
         """
         SELECT id, model_id, suite_id, dataset_id, backend, status,
-               started_at, ended_at, summary_json, report_uri, error_message, created_at
+               started_at, ended_at, summary_json, report_uri, error_message, created_at,
+               git_commit, config_snapshot, seed, worker_version
         FROM runs
         WHERE id=:id
         """,
@@ -494,7 +560,8 @@ def ui_runs():
     runs = fetch_all(
         """
         SELECT id, backend, status, created_at, started_at, ended_at,
-               report_uri, summary_json, error_message
+               report_uri, summary_json, error_message,
+               git_commit, seed, worker_version
         FROM runs
         ORDER BY id DESC
         LIMIT 50
@@ -520,6 +587,12 @@ def ui_runs():
         )
         artifacts_btn = f'<a class="btn btn2" href="/runs/{rid}/artifacts" target="_blank">Artifacts (JSON)</a>'
 
+        full_commit = r.get("git_commit") or ""
+        git_commit = full_commit[:8]
+
+        seed = r.get("seed") or ""
+        worker_version = r.get("worker_version") or ""
+
         rows_html += f"""
         <tr>
           <td>{rid}</td>
@@ -533,7 +606,19 @@ def ui_runs():
             <div><span class="k">tts mean</span> {kpis.get("time_to_success_mean_s")}</div>
             <div><span class="k">episodes</span> {kpis.get("num_episodes")}</div>
           </td>
-          <td><pre>{summary}</pre></td>
+          <td>
+            <div title="{full_commit}">
+               <span class="k">git</span> {git_commit}
+            </div>
+
+            <div><span class="k">seed</span> {seed}</div>
+            <div><span class="k">worker</span> {worker_version}</div>
+            <details>
+              <summary style="cursor:pointer;color:#b8c0ff;" summary_json</summary>
+              <pre>{summary}</pre>
+            </details>
+
+          </td>
           <td style="color:#ffb4b4;">{err}</td>
           <td>{report_btn} {artifacts_btn}</td>
         </tr>
@@ -569,7 +654,7 @@ def ui_runs():
       <table>
         <thead>
           <tr>
-            <th>ID</th><th>Backend</th><th>Status</th><th>Created</th><th>KPIs</th><th>Summary</th><th>Error</th><th>Links</th>
+            <th>ID</th><th>Backend</th><th>Status</th><th>Created</th><th>KPIs</th><th>Repro + Summary</th><th>Error</th><th>Links</th>
           </tr>
         </thead>
         <tbody>
