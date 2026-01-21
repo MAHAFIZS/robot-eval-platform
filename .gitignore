@@ -13,3 +13,8 @@ artifacts/
 **/*.egg-info/
 dist/
 build/
+# Logs
+uvicorn_*.log
+
+# Local test files
+run.json
