@@ -5,7 +5,8 @@ import os
 import logging
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Any, Dict, List
+from typing import Any, Dict, List, Optional, Tuple
+from packages.backend.gates_logic import evaluate_gate_for_candidate
 
 import boto3
 from botocore.client import Config
@@ -186,6 +187,187 @@ def ensure_rollout_video(out_dir: Path, run_id: int, prefer_existing: bool = Tru
 
 
 # ----------------------------
+# Gate helpers (NEW: auto PASS/FAIL so UI stops showing "—")
+# ----------------------------
+def _as_float(x: Any) -> Optional[float]:
+    try:
+        if x is None:
+            return None
+        return float(x)
+    except Exception:
+        return None
+
+
+def _as_int(x: Any) -> Optional[int]:
+    try:
+        if x is None:
+            return None
+        return int(x)
+    except Exception:
+        return None
+
+
+def _dashboard_fields_from_summary(summary: Any) -> Dict[str, Any]:
+    if not isinstance(summary, dict):
+        return {
+            "success_rate": None,
+            "duration_mean_ms": None,
+            "safety_violations": None,
+            "time_to_success_mean_s": None,
+            "num_episodes": None,
+        }
+    return {
+        "success_rate": _as_float(summary.get("success_rate")),
+        "duration_mean_ms": _as_float(summary.get("duration_mean_ms") or summary.get("duration_mean")),
+        "safety_violations": _as_int(summary.get("safety_violations") or summary.get("violations")),
+        "time_to_success_mean_s": _as_float(
+            summary.get("time_to_success_mean_s") or summary.get("time_to_success_mean")
+        ),
+        "num_episodes": _as_int(summary.get("num_episodes") or summary.get("episodes") or summary.get("n_episodes")),
+    }
+
+
+def _delta(a: Any, b: Any) -> Optional[float]:
+    try:
+        if a is None or b is None:
+            return None
+        return float(b) - float(a)
+    except Exception:
+        return None
+
+
+def _pick_kpis(run_row: dict) -> dict:
+    sj = run_row.get("summary_json") or {}
+    k = _dashboard_fields_from_summary(sj)
+    return {
+        "success_rate": k.get("success_rate"),
+        "duration_mean_ms": k.get("duration_mean_ms"),
+        "safety_violations": k.get("safety_violations"),
+        "time_to_success_mean_s": k.get("time_to_success_mean_s"),
+        "num_episodes": k.get("num_episodes"),
+    }
+
+
+def _gate_decision(baseline: dict, cand: dict) -> Tuple[str, dict]:
+    # You can tune these later
+    tol_success = 0.0
+    tol_dur_ms = 0.0
+
+    b = _pick_kpis(baseline)
+    c = _pick_kpis(cand)
+
+    reasons: List[str] = []
+    passed = True
+
+    if b["success_rate"] is not None and c["success_rate"] is not None:
+        if c["success_rate"] < (b["success_rate"] - tol_success):
+            passed = False
+            reasons.append(f"success_rate regressed: {c['success_rate']} < {b['success_rate']} - {tol_success}")
+
+    if b["duration_mean_ms"] is not None and c["duration_mean_ms"] is not None:
+        if c["duration_mean_ms"] > (b["duration_mean_ms"] + tol_dur_ms):
+            passed = False
+            reasons.append(
+                f"duration_mean_ms regressed: {c['duration_mean_ms']} > {b['duration_mean_ms']} + {tol_dur_ms}"
+            )
+
+    if b["safety_violations"] is not None and c["safety_violations"] is not None:
+        if c["safety_violations"] > b["safety_violations"]:
+            passed = False
+            reasons.append(f"safety_violations regressed: {c['safety_violations']} > {b['safety_violations']}")
+
+    details = {
+        "baseline_run_id": baseline["id"],
+        "candidate_run_id": cand["id"],
+        "baseline_kpis": b,
+        "candidate_kpis": c,
+        "deltas": {
+            "success_rate": _delta(b["success_rate"], c["success_rate"]),
+            "duration_mean_ms": _delta(b["duration_mean_ms"], c["duration_mean_ms"]),
+            "safety_violations": _delta(b["safety_violations"], c["safety_violations"]),
+            "time_to_success_mean_s": _delta(b["time_to_success_mean_s"], c["time_to_success_mean_s"]),
+        },
+        "reasons": reasons,
+        "thresholds": {"tol_success": tol_success, "tol_dur_ms": tol_dur_ms},
+    }
+    return ("pass" if passed else "fail"), details
+
+
+def auto_create_gate_if_possible(run_id: int, suite_id: Optional[int], dataset_id: Optional[int], backend: str) -> None:
+    """
+    If a baseline lock exists for (suite_id, dataset_id, backend),
+    create/update gate_evaluations(baseline_run_id, candidate_run_id) with pass/fail.
+    """
+    if suite_id is None or dataset_id is None:
+        logger.info("Gate skipped: run_id=%s has suite_id/dataset_id missing", run_id)
+        return
+
+    # Already exists? (idempotent)
+    existing = fetch_one(
+        """
+        SELECT id
+        FROM gate_evaluations
+        WHERE candidate_run_id = :rid
+        ORDER BY created_at DESC
+        LIMIT 1
+        """,
+        {"rid": run_id},
+    )
+    if existing:
+        logger.info("Gate already exists for run_id=%s (gate_id=%s) - skipping", run_id, existing["id"])
+        return
+
+    lock = fetch_one(
+        """
+        SELECT *
+        FROM baseline_locks
+        WHERE suite_id=:suite_id AND dataset_id=:dataset_id AND backend=:backend
+        """,
+        {"suite_id": suite_id, "dataset_id": dataset_id, "backend": backend},
+    )
+    if not lock:
+        logger.info("Gate skipped: no baseline lock for suite=%s dataset=%s backend=%s", suite_id, dataset_id, backend)
+        return
+
+    baseline_id = lock.get("baseline_run_id")
+    baseline = fetch_one("SELECT id, status, summary_json FROM runs WHERE id=:id", {"id": baseline_id})
+    cand = fetch_one("SELECT id, status, summary_json FROM runs WHERE id=:id", {"id": run_id})
+
+    if not baseline or not cand:
+        logger.warning("Gate skipped: missing baseline or candidate row (baseline=%s candidate=%s)", baseline_id, run_id)
+        return
+
+    # We only gate completed candidate (we are called after completion anyway)
+    if (cand.get("status") or "").lower() != "completed":
+        logger.info("Gate skipped: candidate not completed run_id=%s status=%s", run_id, cand.get("status"))
+        return
+
+    status, details = _gate_decision(baseline, cand)
+
+    row = exec_returning(
+        """
+        INSERT INTO gate_evaluations
+          (baseline_run_id, candidate_run_id, status, details_json)
+        VALUES
+          (:baseline_run_id, :candidate_run_id, :status, CAST(:details AS jsonb))
+        ON CONFLICT (baseline_run_id, candidate_run_id)
+        DO UPDATE SET
+          status = EXCLUDED.status,
+          details_json = EXCLUDED.details_json,
+          created_at = NOW()
+        RETURNING id, status
+        """,
+        {
+            "baseline_run_id": baseline_id,
+            "candidate_run_id": run_id,
+            "status": status,
+            "details": json.dumps(details),
+        },
+    )
+    logger.info("Gate created: run_id=%s baseline=%s status=%s gate_id=%s", run_id, baseline_id, status, row.get("id"))
+
+
+# ----------------------------
 # HTML report with episode table (+ metrics link)
 # ----------------------------
 def build_report_html(run_id: int, status: str, summary: Dict[str, Any], episodes: List[dict]) -> str:
@@ -323,7 +505,11 @@ def build_report_html(run_id: int, status: str, summary: Dict[str, Any], episode
 def evaluate_run(run_id: int) -> dict:
     logger.info("Starting run_id=%s", run_id)
 
-    run = fetch_one("SELECT id, status, backend FROM runs WHERE id=:id", {"id": run_id})
+    # IMPORTANT: include suite_id/dataset_id (needed for baseline lock lookup)
+    run = fetch_one(
+        "SELECT id, status, backend, suite_id, dataset_id FROM runs WHERE id=:id",
+        {"id": run_id},
+    )
     if not run:
         return {"ok": False, "error": "run not found", "run_id": run_id}
 
@@ -434,7 +620,6 @@ def evaluate_run(run_id: int) -> dict:
             mj = ep.get("metrics_json") or {}
             st = (ep.get("status") or "").lower()
 
-            # If metrics_json is missing (e.g. failed eps), treat failed as 0
             if "success" in mj:
                 succ_vals.append(1.0 if mj.get("success") else 0.0)
             else:
@@ -485,7 +670,7 @@ def evaluate_run(run_id: int) -> dict:
         bucket = os.getenv("S3_BUCKET", "artifacts")
         report_uri = upload_folder_to_minio(run_id, out_dir, bucket)
 
-        # 8) Update runs table
+        # 8) Update runs table -> completed
         exec_returning(
             """
             UPDATE runs
@@ -498,6 +683,18 @@ def evaluate_run(run_id: int) -> dict:
             """,
             {"id": run_id, "summary": json.dumps(summary), "report_uri": report_uri},
         )
+
+        # 9) AUTO GATE (creates gate_evaluations row if baseline exists)
+        try:
+            auto_create_gate_if_possible(
+                run_id=run_id,
+                suite_id=run.get("suite_id"),
+                dataset_id=run.get("dataset_id"),
+                backend=run.get("backend"),
+            )
+            logger.info("Auto gate evaluated for run_id=%s", run_id)
+        except Exception:
+            logger.exception("Auto gate evaluation failed for run_id=%s (non-fatal)", run_id)
 
         logger.info("Completed run_id=%s report_uri=%s", run_id, report_uri)
         return {"ok": True, "run_id": run_id, "report_uri": report_uri, "summary": summary}
