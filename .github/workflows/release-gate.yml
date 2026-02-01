@@ -1,0 +1,32 @@
+name: Release Gate
+
+on:
+  push:
+    branches: [ "main" ]
+  pull_request:
+
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check release decision (SHIP/BLOCK)
+        env:
+          BASE_URL: ${{ secrets.GATE_BASE_URL }}
+        run: |
+          set -euo pipefail
+
+          URL="$BASE_URL/api/v1/releases/latest?suite_id=1&dataset_id=1&backend=mujoco"
+          echo "Calling: $URL"
+
+          RESP=$(curl -fsSL "$URL")
+          echo "Response: $RESP"
+
+          DECISION=$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('decision',''))")
+          echo "Decision: $DECISION"
+
+          if [ "$DECISION" = "BLOCK" ]; then
+            echo "❌ BLOCK: failing CI"
+            exit 1
+          fi
+
+          echo "✅ $DECISION: passing CI"
