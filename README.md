@@ -1,100 +1,82 @@
-#Robot Eval Platform
+# Robot Eval Platform
+**CI-style evaluation and regression gating for robot behavior**
 
-CI-style evaluation and regression gating for robot behavior
+A **robot-centric evaluation and regression platform** for learning-enabled controllers, classical control stacks, and simulation-to-real pipelines.
 
-A robot-centric evaluation and regression platform for learning-enabled controllers, classical control stacks, and simulation-to-real pipelines.
+It turns simulation or robot rollouts into **episode-level metrics, videos, reports, and shipping decisions**, answering one critical question:
 
-It turns simulation or robot rollouts into episode-level metrics, videos, reports, and shipping decisions, answering one critical question:
+> **Is the new controller safe and better than the baseline — and can it ship to real hardware?**
 
-Is the new controller safe and better than the baseline — and can it ship to real hardware?
+Think of it as **Continuous Integration (CI) for robot behavior**, not just another ML experiment tracker.
 
-Think of it as Continuous Integration (CI) for robot behavior, not just another ML experiment tracker.
+---
 
-Why this exists
+## Why this exists
 
-Most ML dashboards optimize for loss curves and reward plots.
-Robotics teams care about behavioral correctness and safety:
+Most ML dashboards optimize for **loss curves and reward plots**.  
+Robotics teams care about **behavioral correctness and safety**:
 
-Task success and time-to-completion
+- Task success and time-to-completion
+- Control latency and stability regressions
+- Safety violations and contact events
+- Episode-by-episode failure analysis
+- Video-first debugging
+- Baseline vs candidate comparison before deployment
 
-Control latency and stability regressions
+This platform introduces a **decision layer** between simulation and real robots.
 
-Safety violations and contact events
+---
 
-Episode-by-episode failure analysis
-
-Video-first debugging
-
-Baseline vs candidate comparison before deployment
-
-This platform introduces a decision layer between simulation and real robots.
-
-What problem it solves
+## What problem it solves
 
 Without a gating system:
+- Regressions reach real hardware
+- Engineers rely on manual inspection
+- Videos and metrics live in ad-hoc folders
+- “It worked last week” becomes the norm
 
-Regressions reach real hardware
+**Robot Eval Platform enforces discipline**:
+- Reproducible evaluations
+- Evidence-backed decisions
+- Clear SHIP / BLOCK outcomes
 
-Engineers rely on manual inspection
+---
 
-Videos and metrics live in ad-hoc folders
+## Input → Output (simple mental model)
 
-“It worked last week” becomes the norm
+### Input
+- Simulator or robot rollouts
+- Episode metrics (`metrics.json`)
+- Episode videos (`rollout.mp4`)
+- Run metadata (controller version, task, config)
 
-Robot Eval Platform enforces discipline:
+### Output
+- Run-level summaries
+- Episode browser with videos
+- Baseline vs candidate comparison
+- Automated **gate decisions**:
+  - `SHIP`
+  - `BLOCK`
+  - `PENDING`
 
-Reproducible evaluations
+---
 
-Evidence-backed decisions
+## Core features
 
-Clear SHIP / BLOCK outcomes
+- Run & episode tracking
+- Episode-level metrics
+- Video-first debugging
+- Baseline vs candidate comparison
+- Regression detection via rules
+- Immutable artifacts (S3 / MinIO)
+- Simulation-agnostic design
+- Real-robot compatible
 
-Input → Output (simple mental model)
-Input
+---
 
-Simulator or robot rollouts
+## High-level architecture
 
-Episode metrics (metrics.json)
-
-Episode videos (rollout.mp4)
-
-Run metadata (controller version, task, config)
-
-Output
-
-Run-level summaries
-
-Episode browser with videos
-
-Baseline vs candidate comparison
-
-Automated gate decisions:
-
-SHIP
-
-BLOCK
-
-PENDING
-
-Core features
-
-Run & episode tracking
-
-Episode-level metrics
-
-Video-first debugging
-
-Baseline vs candidate comparison
-
-Regression detection via rules
-
-Immutable artifacts (S3 / MinIO)
-
-Simulation-agnostic design
-
-Real-robot compatible
-
-High-level architecture
+```text
 Controller / Policy / Robot Stack
             |
             v
@@ -109,49 +91,46 @@ Backend API + Database + Artifact Store
             v
           Web Dashboard
 
+## Tech stack
 
-Tech stack
+- Backend: FastAPI
+- Database: PostgreSQL
+- Artifact storage: Local filesystem or S3-compatible (MinIO)
+- Frontend: React + TypeScript
+- Evaluation workers: Simulator-specific or real-robot-specific
 
-Backend: FastAPI
+---
 
-Database: PostgreSQL
+## Gate-based decision logic
 
-Artifact storage: Local filesystem or S3-compatible (MinIO)
+Each **candidate run** is compared against a **locked baseline** using explicit rules, for example:
 
-Frontend: React + TypeScript
+- Success rate ≥ baseline
+- Mean control latency ≤ baseline
+- Safety violations = 0
 
-Evaluation workers: simulator / robot-specific
-
-Gate-based decision logic
-
-Each candidate run is compared against a locked baseline using explicit rules, e.g.:
-
-Success rate ≥ baseline
-
-Mean control latency ≤ baseline
-
-Safety violations = 0
-
-If any blocking rule fails, the run is automatically marked:
+If **any blocking rule fails**, the run is automatically marked:
 
 BLOCK — do not ship
 
 
 This decision is:
 
-Visible in the dashboard
+- Visible in the dashboard
+- Enforceable in CI pipelines
+- Traceable to metrics and videos
 
-Enforceable in CI
+---
 
-Traceable to metrics and videos
+## Simulator-agnostic artifact format
 
-Simulator-agnostic artifact format
+The platform does **not depend on MuJoCo, ROS, or any specific simulator**.
 
-The platform does not depend on MuJoCo, ROS, or a specific simulator.
+Any simulator or real robot system can integrate by exporting standardized artifacts.
 
-Any system can integrate by exporting standardized artifacts.
+### Minimal `metrics.json`
 
-Minimal metrics.json
+```json
 {
   "episode_id": "007",
   "success": false,
@@ -159,7 +138,6 @@ Minimal metrics.json
   "safety_violations": 2,
   "notes": "oscillation near goal"
 }
-
 Required per episode
 
 metrics.json
@@ -214,7 +192,7 @@ This project focuses on evaluation correctness, not user management.
 
 Out of scope (by design):
 
-Authentication & accounts
+Authentication & user accounts
 
 Billing & multi-tenant SaaS
 
