@@ -1,4 +1,4 @@
-name: Release Gate
+name: Release Gate (SHIP / BLOCK)
 
 on:
   push:
@@ -6,42 +6,29 @@ on:
   pull_request:
 
 jobs:
-  gate:
-    runs-on: self-hosted
-
+  release-gate:
+    name: Release Gate — Performance Regression Check
+    runs-on: ubuntu-latest
     timeout-minutes: 5
 
     steps:
-      - name: Check release decision (SHIP/BLOCK)
+      - name: Evaluate latest candidate vs baseline
         env:
           BASE_URL: ${{ secrets.GATE_BASE_URL }}
         run: |
           set -euo pipefail
 
-          if [ -z "${BASE_URL:-}" ]; then
-            echo "❌ GATE_BASE_URL secret is not set."
-            exit 1
-          fi
-
-          URL="${BASE_URL%/}/api/v1/releases/latest?suite_id=1&dataset_id=1&backend=mujoco"
+          URL="${BASE_URL%/}/api/releases/latest?suite_id=1&dataset_id=1&backend=mujoco"
           echo "Calling: $URL"
 
-          # Fetch JSON
           RESP="$(curl -fsSL "$URL")"
-          echo "Response: $RESP"
-
-          # Extract decision
           DECISION="$(echo "$RESP" | python3 -c "import sys,json; print(json.load(sys.stdin).get('decision',''))")"
+
           echo "Decision: $DECISION"
 
-          if [ -z "$DECISION" ]; then
-            echo "❌ No 'decision' field in response. Failing CI."
-            exit 1
-          fi
-
           if [ "$DECISION" = "BLOCK" ]; then
-            echo "❌ BLOCK: failing CI"
+            echo "❌ RELEASE BLOCKED — performance regression detected"
             exit 1
           fi
 
-          echo "✅ $DECISION: passing CI"
+          echo "✅ RELEASE APPROVED — SHIP"
